@@ -168,6 +168,64 @@ func ecrecover(header *types.Header, sigcache *sigLRU) (common.Address, error) {
 	return signer, nil
 }
 
+// CalcDynamicPeriod calculates the dynamic block period based on parent block's gas utilization.
+// Formula: period = P_max - (U_parent / U_target) * (P_max - P_min)
+// Returns c.config.Period for genesis block, zero gas limit, or when ePoA is not configured.
+func (c *Clique) CalcDynamicPeriod(parent *types.Header) uint64 {
+	// If ePoA is not configured (all parameters are zero), use original Period
+	if c.config.MinPeriod == 0 && c.config.MaxPeriod == 0 && c.config.TargetUtilization == 0 {
+		return c.config.Period
+	}
+
+	// Fallback for genesis block or nil parent
+	if parent == nil || parent.Number.Uint64() == 0 {
+		return c.config.Period
+	}
+
+	// Load ePoA parameters with defaults
+	minPeriod := c.config.MinPeriod
+	if minPeriod == 0 {
+		minPeriod = 2 // Default: 2s (Burst Mode)
+	}
+	maxPeriod := c.config.MaxPeriod
+	if maxPeriod == 0 {
+		maxPeriod = 12 // Default: 12s (Eco Mode)
+	}
+	targetUtil := c.config.TargetUtilization
+	if targetUtil == 0 {
+		targetUtil = 50 // Default: 50%
+	}
+
+	// Zero gas limit fallback
+	if parent.GasLimit == 0 {
+		return c.config.Period
+	}
+
+	// Calculate utilization: U_parent = (GasUsed / GasLimit) * 100
+	utilization := (parent.GasUsed * 100) / parent.GasLimit
+
+	// Formula: period = P_max - (U_parent / U_target) * (P_max - P_min)
+	// Using integer math: period = maxPeriod - (utilization * (maxPeriod - minPeriod)) / targetUtil
+	periodDelta := (utilization * (maxPeriod - minPeriod)) / targetUtil
+
+	var period uint64
+	if periodDelta >= maxPeriod-minPeriod {
+		period = minPeriod
+	} else {
+		period = maxPeriod - periodDelta
+	}
+
+	// Clamp to [minPeriod, maxPeriod]
+	if period < minPeriod {
+		period = minPeriod
+	}
+	if period > maxPeriod {
+		period = maxPeriod
+	}
+
+	return period
+}
+
 // Clique is the proof-of-authority consensus engine proposed to support the
 // Ethereum testnet following the Ropsten attacks.
 type Clique struct {
@@ -342,7 +400,15 @@ func (c *Clique) verifyCascadingFields(chain consensus.ChainHeaderReader, header
 	if parent == nil || parent.Number.Uint64() != number-1 || parent.Hash() != header.ParentHash {
 		return consensus.ErrUnknownAncestor
 	}
-	if parent.Time+c.config.Period > header.Time {
+	// Elastic Clique: Use dynamic period based on parent gas utilization
+	dynamicPeriod := c.CalcDynamicPeriod(parent)
+	utilization := uint64(0)
+	if parent.GasLimit > 0 {
+		utilization = (parent.GasUsed * 100) / parent.GasLimit
+	}
+	log.Info("Elastic Clique Adjustment", "parent", parent.Number.Uint64(),
+		"utilization", utilization, "period", dynamicPeriod)
+	if parent.Time+dynamicPeriod > header.Time {
 		return errInvalidTimestamp
 	}
 	// Verify that the gasUsed is <= gasLimit
@@ -566,12 +632,13 @@ func (c *Clique) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	// Mix digest is reserved for now, set to empty
 	header.MixDigest = common.Hash{}
 
-	// Ensure the timestamp has the correct delay
+	// Ensure the timestamp has the correct delay (Elastic Clique: dynamic period)
 	parent := chain.GetHeader(header.ParentHash, number-1)
 	if parent == nil {
 		return consensus.ErrUnknownAncestor
 	}
-	header.Time = parent.Time + c.config.Period
+	dynamicPeriod := c.CalcDynamicPeriod(parent)
+	header.Time = parent.Time + dynamicPeriod
 	if header.Time < uint64(time.Now().Unix()) {
 		header.Time = uint64(time.Now().Unix())
 	}
@@ -647,6 +714,18 @@ func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		}
 	}
 	// Sweet, the protocol permits us to sign the block, wait for our time
+	// Elastic Clique: Log instrumentation for research
+	parent := chain.GetHeader(header.ParentHash, number-1)
+	if parent != nil {
+		dynamicPeriod := c.CalcDynamicPeriod(parent)
+		utilization := uint64(0)
+		if parent.GasLimit > 0 {
+			utilization = (parent.GasUsed * 100) / parent.GasLimit
+		}
+		log.Info("Elastic Clique Seal", "block", number,
+			"parentUtilization", utilization, "period", dynamicPeriod)
+	}
+
 	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
 	if header.Difficulty.Cmp(diffNoTurn) == 0 {
 		// It's not our turn explicitly to sign, delay it a bit

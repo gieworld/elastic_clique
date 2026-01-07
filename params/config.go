@@ -379,6 +379,11 @@ func (c *EthashConfig) String() string {
 type CliqueConfig struct {
 	Period uint64 `json:"period"` // Number of seconds between blocks to enforce
 	Epoch  uint64 `json:"epoch"`  // Epoch length to reset votes and checkpoint
+
+	// Elastic Clique (ePoA) parameters for dynamic block period
+	MinPeriod         uint64 `json:"minPeriod,omitempty"`         // Min period in seconds (Burst Mode), default: 2
+	MaxPeriod         uint64 `json:"maxPeriod,omitempty"`         // Max period in seconds (Eco Mode), default: 12
+	TargetUtilization uint64 `json:"targetUtilization,omitempty"` // Target gas utilization percentage, default: 50
 }
 
 // String implements the stringer interface, returning the consensus engine details.
